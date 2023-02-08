@@ -256,14 +256,17 @@ class DeseqDataSet:
         self.joblib_verbosity = joblib_verbosity
         self.silent = silent
 
-    def deseq2(self):
+    def deseq2(self, size_factors=None):
         """Perform dispersion and log fold-change (LFC) estimation.
 
         Wrapper for the first part of the PyDESeq2 pipeline.
         """
 
         # Compute DESeq2 normalization factors using the Median-of-ratios method
-        self.fit_size_factors()
+        if size_factors is not None:
+            self.set_size_factors(size_factors)
+        else:
+            self.fit_size_factors()
         # Fit an independent negative binomial model per gene
         self.fit_genewise_dispersions()
         # Fit a parameterized trend curve for dispersions, of the form
