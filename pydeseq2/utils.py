@@ -111,13 +111,7 @@ def test_valid_counts(counts_df):
     counts_df : pandas.DataFrame
         Raw counts. One column per gene, rows are indexed by sample barcodes.
     """
-    if counts_df.isna().any().any():
-        raise ValueError("NaNs are not allowed in the count matrix.")
-    if ~counts_df.apply(
-        lambda s: pd.to_numeric(s, errors="coerce").notnull().all()
-    ).all():
-        raise ValueError("The count matrix should only contain numbers.")
-    if (counts_df % 1 != 0).any().any():
+    if (counts_df % 1 > 0).any().any():
         raise ValueError("The count matrix should only contain integers.")
     if (counts_df < 0).any().any():
         raise ValueError("The count matrix should only contain non-negative values.")
@@ -594,19 +588,20 @@ def trimmed_mean(x, trim=0.1, **kwargs):
     float or ndarray :
         Trimmed mean.
     """
-
     assert trim <= 0.5
     if "axis" in kwargs:
         axis = kwargs.get("axis")
         s = np.sort(x, axis=axis)
-        n = x.shape[axis]
+        s = s[np.nansum(s, axis=1) > 0]  # test
+
+        n = s.shape[axis]
         ntrim = floor(n * trim)
-        return np.take(s, np.arange(ntrim, n - ntrim), axis).mean(axis)
+        return np.nanmean(np.take(s, np.arange(ntrim, n - ntrim), axis), axis)
     else:
         n = len(x)
         s = np.sort(x)
         ntrim = floor(n * trim)
-        return s[ntrim : n - ntrim].mean()
+        return np.nanmean(s[ntrim : n - ntrim])
 
 
 def trimmed_cell_variance(counts, cells):
@@ -629,7 +624,6 @@ def trimmed_cell_variance(counts, cells):
     pandas.Series :
         Gene-wise trimmed variance estimate.
     """
-
     # how much to trim at different n
     trimratio = (1 / 3, 1 / 4, 1 / 8)
     # returns an index for the vector above for three sample size bins
@@ -643,6 +637,7 @@ def trimmed_cell_variance(counts, cells):
         cell_means[lvl] = trimmed_mean(
             counts.loc[cells == lvl], trim=trimratio[trimfn(ns[lvl])], axis=0
         )
+
     qmat = cell_means[cells].T
     qmat.index = cells.index
     sqerror = (counts - qmat) ** 2
@@ -791,7 +786,7 @@ def fit_rough_dispersions(counts, size_factors, design_matrix):
     """
 
     num_samples, num_vars = design_matrix.shape
-    normed_counts = counts.div(size_factors, 0)
+    normed_counts = counts.div(size_factors.loc[counts.index].values, 0)
     # Exclude genes with all zeroes
     normed_counts = normed_counts.loc[:, ~(normed_counts == 0).all()]
     reg = LinearRegression(fit_intercept=False)
@@ -822,11 +817,11 @@ def fit_moments_dispersions(counts, size_factors):
     pandas.Series
         Estimated dispersion parameter for each gene.
     """
-    normed_counts = counts.div(size_factors, 0)
+    normed_counts = counts.div(size_factors.loc[counts.index].values, 0)
     # Exclude genes with all zeroes
     normed_counts = normed_counts.loc[:, ~(normed_counts == 0).all()]
     # mean inverse size factor
-    s_mean_inv = (1 / size_factors).mean()
+    s_mean_inv = (1 / size_factors).mean().values
     mu = normed_counts.mean(0)
     sigma = normed_counts.var(0, ddof=1)
     # ddof=1 is to use an unbiased estimator, as in R
@@ -862,7 +857,7 @@ def robust_method_of_moments_disp(normed_counts, design_matrix):
         # last argument is non-intercept.
     else:
         v = trimmed_variance(normed_counts)
-    m = normed_counts.mean(0)
+    m = np.nanmean(normed_counts, axis=0)
     alpha = (v - m) / m**2
     # cannot use the typical min_disp = 1e-8 here or else all counts in the same
     # group as the outlier count will get an extreme Cook's distance
@@ -951,7 +946,6 @@ def nbinomGLM(
     converged: bool
         Whether L-BFGS-B converged.
     """
-
     num_vars = design_matrix.shape[-1]
 
     shrink_mask = np.zeros(num_vars)

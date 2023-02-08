@@ -63,6 +63,10 @@ class DeseqStats:
         The verbosity level for joblib tasks. The higher the value, the more updates
         are reported. (default: 0).
 
+    silent : bool
+        If True, then no progress updates will be printed, and results dataframe
+         will not be displayed.
+
     Attributes
     ----------
     base_mean : pandas.Series
@@ -118,6 +122,7 @@ class DeseqStats:
         prior_disp_var=None,
         batch_size=128,
         joblib_verbosity=0,
+        silent=False,
     ):
         assert hasattr(
             dds, "LFCs"
@@ -148,6 +153,9 @@ class DeseqStats:
         self.independent_filter = independent_filter
         self.prior_disp_var = prior_disp_var
         self.base_mean = self.dds._normed_means
+        self.silent = silent
+
+        self.genes2samples = self.dds.genes2samples
 
         # Initialize the design matrix and LFCs. If the chosen reference level are the
         # same as in dds, keep them unchanged. Otherwise, change reference level.
@@ -232,11 +240,12 @@ class DeseqStats:
         self.results_df["pvalue"] = self.p_values
         self.results_df["padj"] = self.padj
 
-        print(
-            f"Log2 fold change & Wald test p-value: "
-            f"{self.contrast[0]} {self.contrast[1]} vs {self.contrast[2]}"
-        )
-        display(self.results_df)
+        if not self.silent:
+            print(
+                f"Log2 fold change & Wald test p-value: "
+                f"{self.contrast[0]} {self.contrast[1]} vs {self.contrast[2]}"
+            )
+            display(self.results_df)
 
     def run_wald_test(self):
         """Perform a Wald test.
@@ -244,21 +253,20 @@ class DeseqStats:
         Get gene-wise p-values for gene over/under-expression.`
         """
 
-        num_genes = len(self.LFCs)
         num_vars = self.design_matrix.shape[1]
 
         # Raise a warning if LFCs are shrunk.
         if self.shrunk_LFCs:
-            print(
-                "Note: running Wald test on shrunk LFCs. "
-                "Some sequencing datasets show better performance with the testing "
-                "separated from the use of the LFC prior."
-            )
+            if not self.silent:
+                print(
+                    "Note: running Wald test on shrunk LFCs. "
+                    "Some sequencing datasets show better performance with the testing "
+                    "separated from the use of the LFC prior."
+                )
 
-        mu = (
-            np.exp(self.design_matrix @ self.LFCs.T)
-            .multiply(self.dds.size_factors, 0)
-            .values
+        _mu_uncorrected = np.exp(self.design_matrix @ self.LFCs.T)
+        mu = _mu_uncorrected.multiply(
+            self.dds.size_factors.loc[_mu_uncorrected.index].values, 0
         )
 
         # Set regularization factors.
@@ -267,11 +275,11 @@ class DeseqStats:
         else:
             ridge_factor = np.diag(np.repeat(1e-6, num_vars))
 
-        X = self.design_matrix.values
-        disps = self.dds.dispersions.values
-        LFCs = self.LFCs.values
+        disps = self.dds.dispersions
+        LFCs = self.LFCs
 
-        print("Running Wald tests...")
+        if not self.silent:
+            print("Running Wald tests...")
         start = time.time()
         with parallel_backend("loky", inner_max_num_threads=1):
             res = Parallel(
@@ -280,17 +288,18 @@ class DeseqStats:
                 batch_size=self.batch_size,
             )(
                 delayed(wald_test)(
-                    design_matrix=X,
-                    disp=disps[i],
-                    lfc=LFCs[i],
-                    mu=mu[:, i],
+                    design_matrix=self.design_matrix.loc[samples].values,
+                    disp=disps.loc[gene],
+                    lfc=LFCs.loc[gene],
+                    mu=mu.loc[samples, gene],
                     ridge_factor=ridge_factor,
                     idx=self.contrast_idx,
                 )
-                for i in range(num_genes)
+                for gene, samples in self.genes2samples.items()
             )
         end = time.time()
-        print(f"... done in {end-start:.2f} seconds.\n")
+        if not self.silent:
+            print(f"... done in {end-start:.2f} seconds.\n")
 
         pvals, stats, se = zip(*res)
 
@@ -320,20 +329,18 @@ class DeseqStats:
         """
         # Filter genes with all zero counts
         nonzero = self.dds.counts.sum(0) > 0
-        counts_nonzero = self.dds.counts.loc[:, nonzero].values
-        num_genes = counts_nonzero.shape[1]
+        counts_nonzero = self.dds.counts.loc[:, nonzero]
 
-        size = (1.0 / self.dds.dispersions[nonzero]).values
-        offset = np.log(self.dds.size_factors).values
+        size = 1.0 / self.dds.dispersions[nonzero]
+        offset = np.log(self.dds.size_factors.iloc[:, 0])
 
         # Set priors
         prior_no_shrink_scale = 15
         prior_var = self._fit_prior_var()
         prior_scale = np.minimum(np.sqrt(prior_var), 1)
 
-        X = self.design_matrix.values
-
-        print("Fitting MAP LFCs...")
+        if not self.silent:
+            print("Fitting MAP LFCs...")
         start = time.time()
         with parallel_backend("loky", inner_max_num_threads=1):
             res = Parallel(
@@ -342,19 +349,20 @@ class DeseqStats:
                 batch_size=self.batch_size,
             )(
                 delayed(nbinomGLM)(
-                    design_matrix=X,
-                    counts=counts_nonzero[:, i],
-                    size=size[i],
-                    offset=offset,
+                    design_matrix=self.design_matrix.loc[samples].values,
+                    counts=counts_nonzero.loc[samples, gene].values,
+                    size=size.loc[gene],
+                    offset=offset.loc[samples].values,
                     prior_no_shrink_scale=prior_no_shrink_scale,
                     prior_scale=prior_scale,
                     optimizer="L-BFGS-B",
                     shrink_index=self.contrast_idx,
                 )
-                for i in range(num_genes)
+                for gene, samples in self.genes2samples.items()
             )
         end = time.time()
-        print(f"... done in {end-start:.2f} seconds.\n")
+        if not self.silent:
+            print(f"... done in {end-start:.2f} seconds.\n")
 
         lfcs, inv_hessians, l_bfgs_b_converged_ = zip(*res)
 
@@ -372,7 +380,8 @@ class DeseqStats:
             index=self.dds.dispersions[nonzero].index,
         )
         self._lcf_shrink_converged = pd.Series(
-            np.array(l_bfgs_b_converged_), index=self.dds.dispersions[nonzero].index
+            np.array(l_bfgs_b_converged_),
+            index=self.dds.dispersions[nonzero].index,
         )
 
         # Set a flag to indicate that LFCs were shrunk
@@ -385,12 +394,14 @@ class DeseqStats:
             ] / np.log(2)
             self.results_df["lfcSE"] = self.SE / np.log(2)
 
-            print(
-                f"Shrunk Log2 fold change & Wald test p-value: "
-                f"{self.contrast[0]} {self.contrast[1]} vs {self.contrast[2]}"
-            )
+            if not self.silent:
+                print(
+                    f"Shrunk Log2 fold change & Wald test p-value: "
+                    f"{self.contrast[0]} {self.contrast[1]} vs {self.contrast[2]}"
+                )
 
-            display(self.results_df)
+            if not self.silent:
+                display(self.results_df)
 
     def _independent_filtering(self):
         """Compute adjusted p-values using independent filtering.

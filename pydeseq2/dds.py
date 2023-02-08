@@ -48,6 +48,12 @@ class DeseqDataSet:
         the last factor will be considered the variable of interest by default.
         Only bi-level factors are supported. (default: 'condition').
 
+    plate_group : str
+        Name of the column (in clinical df) that defines the different plate
+        groups. Plate groups are meant for sets of samples with a mutually
+        exclusive set of genes, and vice versa. By default, there is only one
+        plate group for the entire experiment. (default: None)
+
     reference_level : str
         The factor to use as a reference. Must be one of the values taken by the design.
         If None, the reference will be chosen alphabetically (last in order).
@@ -85,6 +91,10 @@ class DeseqDataSet:
     joblib_verbosity : int
         The verbosity level for joblib tasks. The higher the value, the more updates
         are reported. (default: 0).
+
+    silent : bool
+        If True, then no progress updates will be printed, and results dataframe
+         will not be displayed.
 
     Attributes
     ----------
@@ -156,6 +166,7 @@ class DeseqDataSet:
         counts,
         clinical,
         design_factors="condition",
+        plate_group=None,
         reference_level=None,
         min_mu=0.5,
         min_disp=1e-8,
@@ -166,9 +177,12 @@ class DeseqDataSet:
         n_cpus=None,
         batch_size=128,
         joblib_verbosity=0,
+        silent=False,
     ):
         """Initialize the DeseqDataSet instance, computing the design matrix and
         the number of multiprocessing threads.
+
+        Edited to accept incomplete samples.
         """
 
         # Test counts before going further
@@ -193,6 +207,36 @@ class DeseqDataSet:
             str
         )
 
+        # For sparse counts matrix
+        self.genes2samples = {}
+        for gene in self.counts.columns:
+            _samples = self.counts[~self.counts[gene].isnull()].index
+            self.genes2samples[gene] = _samples.tolist()
+
+        # Check plate group
+        self.plate_group = plate_group
+        if self.plate_group is None and self.counts.isnull().sum().sum() == 0:
+            self.clinical["plate_group"] = 0
+            self.plate_group = "plate_group"
+
+        if self.plate_group not in self.clinical.columns:
+            raise ValueError(
+                "Plate Group Col must be in clinical df if counts matrix is sparse."
+            )
+
+        self.plate_groups = {
+            p: (
+                self.clinical[self.clinical[self.plate_group] == p].index.tolist(),
+                self.counts[self.clinical[self.plate_group] == p]
+                .iloc[
+                    0,
+                ]
+                .dropna()
+                .index.tolist(),
+            )
+            for p in self.clinical[self.plate_group].sort_values().unique()
+        }
+
         # Build the design matrix (splits the dataset in cohorts)
         self.design_matrix = build_design_matrix(
             clinical_df=self.clinical,
@@ -210,6 +254,7 @@ class DeseqDataSet:
         self.n_processes = get_num_processes(n_cpus)
         self.batch_size = batch_size
         self.joblib_verbosity = joblib_verbosity
+        self.silent = silent
 
     def deseq2(self):
         """Perform dispersion and log fold-change (LFC) estimation.
@@ -243,11 +288,14 @@ class DeseqDataSet:
 
         Uses the median-of-ratios method.
         """
-        print("Fitting size factors...")
+        if not self.silent:
+            print("Fitting size factors...")
         start = time.time()
-        _, self.size_factors = deseq2_norm(self.counts)
+        _, size_factors = deseq2_norm(self.counts)
+        self.set_size_factors(size_factors)
         end = time.time()
-        print(f"... done in {end - start:.2f} seconds.\n")
+        if not self.silent:
+            print(f"... done in {end - start:.2f} seconds.\n")
 
     def fit_genewise_dispersions(self):
         """Fit gene-wise dispersion estimates.
@@ -267,13 +315,11 @@ class DeseqDataSet:
         # Exclude genes with all zeroes
         non_zero = ~(self.counts == 0).all()
         self.non_zero_genes = non_zero[non_zero].index
-        counts_nonzero = self.counts.loc[:, self.non_zero_genes].values
-        num_genes = counts_nonzero.shape[1]
+        counts_nonzero = self.counts.loc[:, self.non_zero_genes]
 
         # Convert design_matrix to numpy for speed
-        X = self.design_matrix.values
-        rough_disps = self._rough_dispersions.loc[self.non_zero_genes].values
-        size_factors = self.size_factors.values
+        rough_disps = self._rough_dispersions.loc[self.non_zero_genes]
+        size_factors = self.size_factors
 
         # mu_hat is initialized differently depending on the number of different factor
         # groups. If there are as many different factor combinations as design factors
@@ -288,12 +334,12 @@ class DeseqDataSet:
                         batch_size=self.batch_size,
                     )(
                         delayed(fit_lin_mu)(
-                            counts=counts_nonzero[:, i],
-                            size_factors=size_factors,
-                            design_matrix=X,
+                            counts=counts_nonzero.loc[samples, gene].values,
+                            size_factors=size_factors.loc[samples].values.flatten(),
+                            design_matrix=self.design_matrix.loc[samples].values,
                             min_mu=self.min_mu,
                         )
-                        for i in range(num_genes)
+                        for gene, samples in self.genes2samples.items()
                     )
                 )
         else:
@@ -304,26 +350,31 @@ class DeseqDataSet:
                     batch_size=self.batch_size,
                 )(
                     delayed(irls_solver)(
-                        counts=counts_nonzero[:, i],
-                        size_factors=size_factors,
-                        design_matrix=X,
-                        disp=rough_disps[i],
+                        counts=counts_nonzero.loc[samples, gene].values,
+                        size_factors=size_factors.loc[samples].values.flatten(),
+                        design_matrix=self.design_matrix.loc[samples].values,
+                        disp=rough_disps.loc[gene],
                         min_mu=self.min_mu,
                         beta_tol=self.beta_tol,
                     )
-                    for i in range(num_genes)
+                    for gene, samples in self.genes2samples.items()
                 )
 
                 _, mu_hat_, _, _ = zip(*res)
-                mu_hat_ = np.array(mu_hat_)
+                mu_hat_ = np.array(mu_hat_)  # dtype = object for ragged causing error
 
+        # construct sparse mu hat
         self._mu_hat = pd.DataFrame(
-            mu_hat_.T,
+            np.nan,
             index=self.counts.index,
             columns=self.non_zero_genes,
         )
+        for (gene, samples), mu_hat in zip(self.genes2samples.items(), mu_hat_):
+            self._mu_hat.loc[samples, gene] = mu_hat
 
-        print("Fitting dispersions...")
+        # Fitting Dispersions
+        if not self.silent:
+            print("Fitting dispersions...")
         start = time.time()
         with parallel_backend("loky", inner_max_num_threads=1):
             res = Parallel(
@@ -332,17 +383,18 @@ class DeseqDataSet:
                 batch_size=self.batch_size,
             )(
                 delayed(fit_alpha_mle)(
-                    counts=counts_nonzero[:, i],
-                    design_matrix=X,
-                    mu=mu_hat_[i, :],
-                    alpha_hat=rough_disps[i],
+                    counts=counts_nonzero.loc[samples, gene].values,
+                    design_matrix=self.design_matrix.loc[samples].values,
+                    mu=self._mu_hat.loc[samples, gene].values.T,
+                    alpha_hat=rough_disps.loc[gene],
                     min_disp=self.min_disp,
                     max_disp=self.max_disp,
                 )
-                for i in range(num_genes)
+                for gene, samples in self.genes2samples.items()
             )
         end = time.time()
-        print(f"... done in {end - start:.2f} seconds.\n")
+        if not self.silent:
+            print(f"... done in {end - start:.2f} seconds.\n")
 
         dispersions_, l_bfgs_b_converged_ = zip(*res)
         self.genewise_dispersions = pd.Series(np.NaN, index=self.counts.columns)
@@ -365,9 +417,12 @@ class DeseqDataSet:
         if not hasattr(self, "genewise_dispersions"):
             self.fit_genewise_dispersions()
 
-        print("Fitting dispersion trend curve...")
+        if not self.silent:
+            print("Fitting dispersion trend curve...")
         start = time.time()
-        self._normed_means = self.counts.div(self.size_factors, 0).mean(0)
+        self._normed_means = self.counts.div(
+            self.size_factors.loc[self.counts.index].values, 0
+        ).mean(0)
 
         # Exclude all-zero counts
         targets = self.genewise_dispersions.loc[self.non_zero_genes].copy()
@@ -411,7 +466,8 @@ class DeseqDataSet:
             )
 
         end = time.time()
-        print(f"... done in {end - start:.2f} seconds.\n")
+        if not self.silent:
+            print(f"... done in {end - start:.2f} seconds.\n")
 
         self.trend_coeffs = pd.Series(coeffs, index=["a0", "a1"])
         self.fitted_dispersions = pd.Series(
@@ -440,7 +496,7 @@ class DeseqDataSet:
         # Fit dispersions to the curve, and compute log residuals
         disp_residuals = np.log(self.genewise_dispersions) - np.log(
             self.fitted_dispersions
-        )
+        )  # type: ignore
 
         # Compute squared log-residuals and prior variance based on genes whose
         # dispersions are above 100 * min_disp. This is to reproduce DESeq2's behaviour.
@@ -451,7 +507,8 @@ class DeseqDataSet:
             disp_residuals.loc[self.non_zero_genes][above_min_disp]
         ).median() ** 2 / norm.ppf(0.75)
         self.prior_disp_var = np.maximum(
-            self._squared_logres - polygamma(1, (num_genes - num_vars) / 2), 0.25
+            self._squared_logres - polygamma(1, (num_genes - num_vars) / 2),
+            0.25,
         )
 
     def fit_MAP_dispersions(self):
@@ -465,14 +522,12 @@ class DeseqDataSet:
             self.fit_dispersion_prior()
 
         # Exclude genes with all zeroes
-        counts_nonzero = self.counts.loc[:, self.non_zero_genes].values
-        num_genes = counts_nonzero.shape[1]
+        counts_nonzero = self.counts.loc[:, self.non_zero_genes]
 
-        X = self.design_matrix.values
-        mu_hat = self._mu_hat.values
-        fit_disps = self.fitted_dispersions.loc[self.non_zero_genes].values
+        fit_disps = self.fitted_dispersions.loc[self.non_zero_genes]
 
-        print("Fitting MAP dispersions...")
+        if not self.silent:
+            print("Fitting MAP dispersions...")
         start = time.time()
         with parallel_backend("loky", inner_max_num_threads=1):
             res = Parallel(
@@ -481,20 +536,21 @@ class DeseqDataSet:
                 batch_size=self.batch_size,
             )(
                 delayed(fit_alpha_mle)(
-                    counts=counts_nonzero[:, i],
-                    design_matrix=X,
-                    mu=mu_hat[:, i],
-                    alpha_hat=fit_disps[i],
+                    counts=counts_nonzero.loc[samples, gene].values,
+                    design_matrix=self.design_matrix.loc[samples].values,
+                    mu=self._mu_hat.loc[samples, gene].values.T,
+                    alpha_hat=fit_disps.loc[gene],
                     min_disp=self.min_disp,
                     max_disp=self.max_disp,
                     prior_disp_var=self.prior_disp_var,
                     cr_reg=True,
                     prior_reg=True,
                 )
-                for i in range(num_genes)
+                for gene, samples in self.genes2samples.items()
             )
         end = time.time()
-        print(f"... done in {end-start:.2f} seconds.\n")
+        if not self.silent:
+            print(f"... done in {end-start:.2f} seconds.\n")
 
         dispersions_, l_bfgs_b_converged_ = zip(*res)
         self.MAP_dispersions = pd.Series(np.NaN, index=self.fitted_dispersions.index)
@@ -526,14 +582,12 @@ class DeseqDataSet:
             self.fit_MAP_dispersions()
 
         # Exclude genes with all zeroes
-        counts_nonzero = self.counts.loc[:, self.non_zero_genes].values
-        num_genes = counts_nonzero.shape[1]
+        counts_nonzero = self.counts.loc[:, self.non_zero_genes]
 
-        X = self.design_matrix.values
-        size_factors = self.size_factors.values
-        disps = self.dispersions.loc[self.non_zero_genes].values
+        disps = self.dispersions.loc[self.non_zero_genes]
 
-        print("Fitting LFCs...")
+        if not self.silent:
+            print("Fitting LFCs...")
         start = time.time()
         with parallel_backend("loky", inner_max_num_threads=1):
             res = Parallel(
@@ -542,46 +596,52 @@ class DeseqDataSet:
                 batch_size=self.batch_size,
             )(
                 delayed(irls_solver)(
-                    counts=counts_nonzero[:, i],
-                    size_factors=size_factors,
-                    design_matrix=X,
-                    disp=disps[i],
+                    counts=counts_nonzero.loc[samples, gene].values,
+                    size_factors=self.size_factors.loc[samples].values.flatten(),
+                    design_matrix=self.design_matrix.loc[samples].values,
+                    disp=disps.loc[gene],
                     min_mu=self.min_mu,
                     beta_tol=self.beta_tol,
                 )
-                for i in range(num_genes)
+                for gene, samples in self.genes2samples.items()
             )
         end = time.time()
-        print(f"... done in {end-start:.2f} seconds.\n")
+        if not self.silent:
+            print(f"... done in {end-start:.2f} seconds.\n")
 
         MAP_lfcs_, mu_, hat_diagonals_, converged_ = zip(*res)
 
+        # construct sparse mu
+        self._mu_LFC = pd.DataFrame(
+            np.nan,
+            index=self.counts.index,
+            columns=self.non_zero_genes,
+        )
+        for (gene, samples), mu_hat in zip(self.genes2samples.items(), mu_):
+            self._mu_LFC.loc[samples, gene] = mu_hat
+
+        # construct hat diag
+        self._hat_diagonals = pd.DataFrame(
+            np.nan,
+            index=self.counts.index,
+            columns=self.non_zero_genes,
+        )
+        for (gene, samples), diag in zip(self.genes2samples.items(), hat_diagonals_):
+            self._hat_diagonals.loc[samples, gene] = diag
+
+        # assemble dataframes
         self.LFCs = pd.DataFrame(
-            np.NaN, index=self.dispersions.index, columns=self.design_matrix.columns
+            np.NaN,
+            index=self.dispersions.index,
+            columns=self.design_matrix.columns,
         )
 
         self.LFCs.update(
             pd.DataFrame(
-                MAP_lfcs_, index=self.non_zero_genes, columns=self.design_matrix.columns
-            )
-        )
-
-        self._mu_LFC = pd.DataFrame(
-            np.array(mu_).T, index=self.counts.index, columns=self.non_zero_genes
-        )
-
-        self._hat_diagonals = pd.DataFrame(
-            np.NaN,
-            index=self.dispersions.index,
-            columns=self.design_matrix.index,
-        ).T
-
-        self._hat_diagonals.update(
-            pd.DataFrame(
-                hat_diagonals_,
+                MAP_lfcs_,
                 index=self.non_zero_genes,
-                columns=self.design_matrix.index,
-            ).T
+                columns=self.design_matrix.columns,
+            )
         )
 
         self._LFC_converged = pd.DataFrame(converged_, index=self.non_zero_genes)
@@ -598,12 +658,15 @@ class DeseqDataSet:
 
         num_vars = self.design_matrix.shape[1]
         # Keep only non-zero genes
-        normed_counts = self.counts.loc[:, self.non_zero_genes].div(self.size_factors, 0)
+        normed_counts = self.counts.loc[:, self.non_zero_genes].div(
+            self.size_factors.loc[self.counts.index].values, 0
+        )
         dispersions = robust_method_of_moments_disp(normed_counts, self.design_matrix)
         V = self._mu_LFC + dispersions * self._mu_LFC**2
         squared_pearson_res = (
             self.counts.loc[:, self.non_zero_genes] - self._mu_LFC
         ) ** 2 / V
+
         self.cooks = (
             squared_pearson_res
             / num_vars
@@ -618,7 +681,8 @@ class DeseqDataSet:
         """
         # Replace outlier counts
         self._replace_outliers()
-        print(f"Refitting {self.replaced.sum()} outliers.\n")
+        if not self.silent:
+            print(f"Refitting {self.replaced.sum()} outliers.\n")
 
         if self.replaced.sum() > 0:
             # Refit dispersions and LFCs for genes that had outliers replaced
@@ -633,8 +697,28 @@ class DeseqDataSet:
         if not hasattr(self, "size_factors"):
             self.fit_size_factors()
 
-        rde = fit_rough_dispersions(self.counts, self.size_factors, self.design_matrix)
-        mde = fit_moments_dispersions(self.counts, self.size_factors)
+        rdes = []
+        mdes = []
+        for _, (samples, genes) in self.plate_groups.items():
+            if len(genes) == 0:
+                continue
+
+            rdes.append(
+                fit_rough_dispersions(
+                    self.counts.loc[samples, genes],
+                    self.size_factors.loc[samples],
+                    self.design_matrix.loc[samples],
+                )
+            )
+
+            mdes.append(
+                fit_moments_dispersions(
+                    self.counts.loc[samples, genes], self.size_factors.loc[samples]
+                )
+            )
+        rde = pd.concat(rdes)
+        mde = pd.concat(mdes)
+
         alpha_hat = np.minimum(rde, mde)
         self._rough_dispersions = np.clip(alpha_hat, self.min_disp, self.max_disp)
 
@@ -669,7 +753,7 @@ class DeseqDataSet:
 
         trim_base_mean = pd.DataFrame(
             trimmed_mean(
-                self.counts_to_refit.divide(self.size_factors, 0),
+                self.counts_to_refit.divide(self.size_factors.values, 0),
                 trim=0.2,
                 axis=0,
             ),
@@ -677,7 +761,7 @@ class DeseqDataSet:
         )
         replacement_counts = (
             pd.DataFrame(
-                trim_base_mean.values * self.size_factors.values,
+                trim_base_mean.values * self.size_factors.values[:, 0],
                 index=self.counts_to_refit.columns,
                 columns=self.size_factors.index,
             )
@@ -710,6 +794,7 @@ class DeseqDataSet:
             counts=self.counts_to_refit,
             clinical=self.clinical,
             design_factors=self.design_factors,
+            plate_group=self.plate_group,
             min_mu=self.min_mu,
             min_disp=self.min_disp,
             max_disp=self.max_disp,
@@ -718,6 +803,7 @@ class DeseqDataSet:
             beta_tol=self.beta_tol,
             n_cpus=self.n_processes,
             batch_size=self.batch_size,
+            silent=self.silent,
         )
 
         # Use the same size factors
@@ -759,3 +845,11 @@ class DeseqDataSet:
         # Take into account new all-zero genes
         self._normed_means.loc[self.new_all_zeroes[self.new_all_zeroes].index] = 0
         self.LFCs.loc[self.new_all_zeroes[self.new_all_zeroes].index] = 0
+
+    def set_size_factors(self, size_factors: pd.DataFrame):
+        if type(size_factors) == pd.Series:
+            self.size_factors = pd.DataFrame(size_factors, columns=["scaling_factor"])
+        elif type(size_factors) == pd.DataFrame:
+            self.size_factors = size_factors
+        else:
+            raise ValueError(f"Unrecognized type for size_factor: {type(size_factors)}")
